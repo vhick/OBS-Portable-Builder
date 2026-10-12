@@ -1,0 +1,109 @@
+name: TEST OBS Meeting Recorder Portable Windows x64
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_repository:
+        description: "Clean OBS fork (blank = official upstream obsproject/obs-studio)"
+        type: string
+        required: false
+        default: ""
+      source_ref:
+        description: "Inspected OBS commit SHA (recommended) or master"
+        type: string
+        required: true
+        default: "7d98bebe1115b12608837b622164ea5fe6d9483a"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: obs-meeting-portable-test
+  cancel-in-progress: false
+
+jobs:
+  windows-build:
+    name: Experimental OBS Windows x64
+    # Match upstream's VS 2026 build environment; runner availability may vary.
+    runs-on: windows-2025-vs2026
+    timeout-minutes: 180
+    defaults:
+      run:
+        shell: pwsh
+
+    steps:
+      - name: Checkout independent builder scripts
+        uses: actions/checkout@v4
+        with:
+          path: builder
+
+      - name: Select clean OBS source
+        id: src
+        env:
+          USER_REPO: ${{ inputs.source_repository }}
+          USER_REF: ${{ inputs.source_ref }}
+        run: |
+          $repo = $env:USER_REPO.Trim()
+          if (-not $repo) { $repo = 'obsproject/obs-studio' }
+          if ($repo -notmatch '^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$') { throw 'Invalid source repository' }
+          if (-not $env:USER_REF) { throw 'Missing OBS source reference' }
+          "repo=$repo" >> $env:GITHUB_OUTPUT
+          "ref=$env:USER_REF" >> $env:GITHUB_OUTPUT
+          Write-Host "Using $repo at $env:USER_REF"
+
+      - name: Checkout OBS including submodules and history
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ steps.src.outputs.repo }}
+          ref: ${{ steps.src.outputs.ref }}
+          path: source
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: Report exact source commit
+        id: revision
+        run: |
+          $sha=(git -C source rev-parse HEAD).Trim()
+          "sha=$sha" >> $env:GITHUB_OUTPUT
+          Write-Host "OBS commit: $sha"
+
+      - name: Apply narrowly scoped source patch
+        run: |
+          python builder/scripts/Patch-OBS-Meeting-Portable.py --root source --report build-report/patch-report.txt
+          if ($LASTEXITCODE -ne 0) { throw 'Source patch rejected unexpected upstream code' }
+          python builder/scripts/Verify-OBS-Meeting-Portable.py --root source --report build-report/source-verification.txt
+          if ($LASTEXITCODE -ne 0) { throw 'Experimental source verification failed' }
+
+      - name: Build with OBS upstream Windows script
+        working-directory: source
+        run: |
+          & .\.github\scripts\Build-Windows.ps1 -Target x64 -Configuration RelWithDebInfo
+          if ($LASTEXITCODE -ne 0) { throw 'OBS native Windows compilation failed' }
+
+      - name: Package with OBS upstream Windows script
+        working-directory: source
+        run: |
+          & .\.github\scripts\Package-Windows.ps1 -Target x64 -Configuration RelWithDebInfo
+          if ($LASTEXITCODE -ne 0) { throw 'OBS upstream packaging failed' }
+
+      - name: Assemble isolated OBS meeting recorder ZIP
+        run: |
+          & .\builder\scripts\Assemble-OBS-Meeting-Zip.ps1 -SourceRoot "$PWD\source" -BuilderRoot "$PWD\builder" -OutputRoot "$PWD\release"
+          if (-not $?) { throw 'Experimental assembly failed' }
+
+      - name: Upload experimental application ZIP
+        uses: actions/upload-artifact@v4
+        with:
+          name: OBS-Meeting-Portable-TEST-${{ steps.revision.outputs.sha }}
+          path: release/*.zip
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload source diagnostics (including failed builds)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: OBS-Meeting-Portable-Diagnostics-${{ github.run_id }}
+          path: build-report/**
+          if-no-files-found: warn
+          retention-days: 14
